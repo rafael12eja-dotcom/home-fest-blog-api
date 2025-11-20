@@ -4,128 +4,231 @@ const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
 
-// A biblioteca oficial openai v4. Você pode usar depois para gerar posts automaticamente.
-const OpenAI = require("openai");
-
 const app = express();
 const PORT = process.env.PORT || 3000;
-const ORIGIN_FRONTEND = process.env.ORIGIN_FRONTEND || "http://localhost:5173";
+const API_KEY = process.env.API_KEY || "";
 
-app.use(cors({
-  origin: ORIGIN_FRONTEND,
-}));
+// ------- CORS CONFIG -------
+const allowedOrigins = new Set();
+
+// ORIGIN_FRONTEND único
+if (process.env.ORIGIN_FRONTEND) {
+  allowedOrigins.add(process.env.ORIGIN_FRONTEND.trim());
+}
+
+// Vários domínios em CORS_ORIGINS separados por vírgula
+if (process.env.CORS_ORIGINS) {
+  process.env.CORS_ORIGINS.split(",").forEach((origin) => {
+    const clean = origin.trim();
+    if (clean) allowedOrigins.add(clean);
+  });
+}
+
+const corsOptions = {
+  origin: function (origin, callback) {
+    // Thunder Client / servidor sem origin
+    if (!origin) {
+      return callback(null, true);
+    }
+
+    if (allowedOrigins.has(origin)) {
+      return callback(null, true);
+    }
+
+    console.warn("Origin não permitido pelo CORS:", origin);
+    return callback(new Error("Not allowed by CORS"));
+  },
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
 
-// Carrega posts de um arquivo JSON simples
-const POSTS_FILE = path.join(__dirname, "posts.json");
+// ------- FUNÇÕES UTILITÁRIAS PARA posts.json -------
+
+const postsFilePath = path.join(__dirname, "posts.json");
 
 function readPosts() {
-  if (!fs.existsSync(POSTS_FILE)) {
-    return [];
-  }
-  const text = fs.readFileSync(POSTS_FILE, "utf8");
   try {
-    return JSON.parse(text);
+    if (!fs.existsSync(postsFilePath)) {
+      return [];
+    }
+    const raw = fs.readFileSync(postsFilePath, "utf-8");
+    if (!raw.trim()) {
+      return [];
+    }
+    return JSON.parse(raw);
   } catch (err) {
     console.error("Erro ao ler posts.json:", err);
     return [];
   }
 }
 
-// GET /blog/posts - lista de posts
-app.get("/blog/posts", (req, res) => {
-  const posts = readPosts();
-  const summaries = posts.map(p => ({
-    slug: p.slug,
-    title: p.title,
-    excerpt: p.excerpt,
-    date: p.date,
-    readingTime: p.readingTime || "5 min",
-    tags: p.tags || [],
-    coverImage: p.coverImage || "",
-  }));
-  res.json(summaries);
+function writePosts(posts) {
+  try {
+    fs.writeFileSync(postsFilePath, JSON.stringify(posts, null, 2), "utf-8");
+  } catch (err) {
+    console.error("Erro ao gravar posts.json:", err);
+  }
+}
+
+// ------- MIDDLEWARE DE API KEY -------
+
+function requireApiKey(req, res, next) {
+  if (!API_KEY) {
+    console.warn("API_KEY não configurada no servidor.");
+    return res.status(500).json({ error: "API_KEY não configurada no servidor" });
+  }
+
+  const key = req.header("x-api-key");
+  if (!key) {
+    return res.status(401).json({ error: "x-api-key não enviada" });
+  }
+
+  if (key !== API_KEY) {
+    return res.status(403).json({ error: "API key inválida" });
+  }
+
+  next();
+}
+
+// ------- ROTAS PÚBLICAS (SEM API KEY) -------
+
+app.get("/", (req, res) => {
+  res.json({
+    status: "ok",
+    message: "Home Fest Blog API online",
+  });
 });
 
-// GET /blog/posts/:slug - detalhe
-app.get("/blog/posts/:slug", (req, res) => {
+// Listar todos os posts
+app.get(["/posts", "/api/posts"], (req, res) => {
+  const posts = readPosts();
+  res.json(posts);
+});
+
+// Obter post por slug
+app.get(["/posts/:slug", "/api/posts/:slug"], (req, res) => {
   const { slug } = req.params;
   const posts = readPosts();
-  const post = posts.find(p => p.slug === slug);
+  const post = posts.find((p) => p.slug === slug);
+
   if (!post) {
     return res.status(404).json({ error: "Post não encontrado" });
   }
+
   res.json(post);
 });
 
-// Rota opcional: gerar um post usando OpenAI (admin)
-// IMPORTANTE: Não exponha isso sem autenticação em produção.
-app.post("/admin/generate-post", async (req, res) => {
-  const { topic, tags } = req.body || {};
-  if (!topic) {
-    return res.status(400).json({ error: "topic é obrigatório" });
+// ------- ROTAS PROTEGIDAS (COM API KEY) -------
+
+// Criar novo post
+app.post(["/posts", "/api/posts"], requireApiKey, (req, res) => {
+  const {
+    title,
+    slug,
+    excerpt,
+    content,
+    coverImage,
+    coverAlt,
+    date,
+    readingTime,
+    tags,
+  } = req.body;
+
+  if (!title || !slug) {
+    return res
+      .status(400)
+      .json({ error: "Campos obrigatórios: title e slug" });
   }
 
-  const apiKey = process.env.OPENAI_API_KEY;
-  if (!apiKey) {
-    return res.status(500).json({ error: "OPENAI_API_KEY não configurada" });
+  const posts = readPosts();
+
+  if (posts.some((p) => p.slug === slug)) {
+    return res.status(409).json({ error: "Já existe um post com esse slug" });
   }
 
-  const client = new OpenAI({ apiKey });
+  const newPost = {
+    title,
+    slug,
+    excerpt: excerpt || "",
+    content: content || "",
+    coverImage: coverImage || "",
+    coverAlt: coverAlt || "",
+    date: date || new Date().toISOString().slice(0, 10),
+    readingTime: readingTime || "",
+    tags: Array.isArray(tags) ? tags : [],
+  };
 
-  try {
-    const completion = await client.responses.create({
-      model: "gpt-4.1-mini",
-      input: [
-        {
-          role: "system",
-          content: "Você é um redator especializado em festas, eventos e buffet em domicílio em Belo Horizonte."
-        },
-        {
-          role: "user",
-          content: `Crie um artigo em HTML sobre o tema: "${topic}". Use tom acolhedor, sofisticado e prático. Gere título, subtítulos e parágrafos. Não use cabeçalho <h1>, apenas <h2> e <h3>.`
-        }
-      ]
-    });
+  posts.push(newPost);
+  writePosts(posts);
 
-    const contentText = completion.output[0].content[0].text;
+  res.status(201).json(newPost);
+});
 
-    const now = new Date();
-    const date = now.toISOString().slice(0, 10);
-    const slug = topic
-      .toLowerCase()
-      .normalize("NFD")
-      .replace(/[\u0300-\u036f]/g, "")
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/(^-|-$)+/g, "");
+// Atualizar post existente
+app.put(["/posts/:slug", "/api/posts/:slug"], requireApiKey, (req, res) => {
+  const { slug } = req.params;
+  const {
+    title,
+    excerpt,
+    content,
+    coverImage,
+    coverAlt,
+    date,
+    readingTime,
+    tags,
+  } = req.body;
 
-    const newPost = {
-      slug,
-      title: topic,
-      excerpt: `Artigo sobre ${topic} com dicas práticas para organizar eventos com a Home Fest & Eventos em Belo Horizonte.`,
-      date,
-      readingTime: "7 min",
-      tags: Array.isArray(tags) ? tags : [],
-      coverImage: "",
-      coverAlt: topic,
-      content: contentText,
-    };
+  const posts = readPosts();
+  const index = posts.findIndex((p) => p.slug === slug);
 
+  if (index === -1) {
+    return res.status(404).json({ error: "Post não encontrado" });
+  }
+
+  const existing = posts[index];
+
+  const updatedPost = {
+    ...existing,
+    title: title ?? existing.title,
+    excerpt: excerpt ?? existing.excerpt,
+    content: content ?? existing.content,
+    coverImage: coverImage ?? existing.coverImage,
+    coverAlt: coverAlt ?? existing.coverAlt,
+    date: date ?? existing.date,
+    readingTime: readingTime ?? existing.readingTime,
+    tags: Array.isArray(tags) ? tags : existing.tags,
+  };
+
+  posts[index] = updatedPost;
+  writePosts(posts);
+
+  res.json(updatedPost);
+});
+
+// Deletar post
+app.delete(
+  ["/posts/:slug", "/api/posts/:slug"],
+  requireApiKey,
+  (req, res) => {
+    const { slug } = req.params;
     const posts = readPosts();
-    posts.unshift(newPost);
-    fs.writeFileSync(POSTS_FILE, JSON.stringify(posts, null, 2), "utf8");
+    const index = posts.findIndex((p) => p.slug === slug);
 
-    res.json(newPost);
-  } catch (err) {
-    console.error("Erro ao gerar post com OpenAI:", err);
-    res.status(500).json({ error: "Erro ao gerar post com OpenAI" });
+    if (index === -1) {
+      return res.status(404).json({ error: "Post não encontrado" });
+    }
+
+    const deleted = posts[index];
+    posts.splice(index, 1);
+    writePosts(posts);
+
+    res.json({ success: true, deleted });
   }
-});
+);
 
-app.get("/", (req, res) => {
-  res.json({ ok: true, message: "API de Blog Home Fest & Eventos" });
-});
+// ------- START -------
 
 app.listen(PORT, () => {
-  console.log(`Blog API rodando em http://localhost:${PORT}`);
+  console.log(`Home Fest Blog API rodando na porta ${PORT}`);
 });
